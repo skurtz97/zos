@@ -1,0 +1,183 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# zfs-rebuild - replace the home aggregate with a right-sized one and create
+#               a new aggregate for a replacement zopen root (z/OS, ZOAU)
+#
+# usage: zfs-rebuild [-n] [-v] [-f] home-copy    new small home aggregate + copy
+#        zfs-rebuild [-n] [-v] -f   home-swap    swap new home in (run as superuser,
+#                                                 NOT from a session using $HOME)
+#        zfs-rebuild [-n] [-v]      zopen-new    new zopen aggregate, mounted
+#        zfs-rebuild [-n] [-v] -f   delete-old   delete the retired home aggregate
+#
+#   -n  dry run: print commands and IDCAMS input, change nothing
+#   -v  verbose
+#   -f  required for destructive steps (home-swap, delete-old)
+#
+# Run in order: home-copy, home-swap, then zopen-new (a zopen aggregate mounted
+# under $HOME would block the home unmount), and delete-old once the new
+# home is confirmed good. Settings below can be overridden from the environment.
+
+prog=${0##*/}
+user=$(id -un | tr '[:lower:]' '[:upper:]')
+
+HOME_DIR=${HOME_DIR:-$HOME}
+HOME_DS=${HOME_DS:-$user.OMVS.ZFS}            # name automount expects
+HOME_NEW=${HOME_NEW:-$user.OMVS.NEW.ZFS}
+HOME_OLD=${HOME_OLD:-$user.OMVS.OLD.ZFS}
+HOME_CYL=${HOME_CYL:-150 50}
+HOME_STAGE=${HOME_STAGE:-/tmp/$user.newhome}
+
+ZOPEN_DS=${ZOPEN_DS:-$user.ZOPEN.NEW.ZFS}
+ZOPEN_CYL=${ZOPEN_CYL:-8000 1000}
+ZOPEN_DIR=${ZOPEN_DIR:-$HOME_DIR/zopen-new}
+DATACLAS=${DATACLAS:-}                        # extended-addressability class for >4GB
+
+SUDO=${SUDO-sudo}                             # set SUDO= if already superuser
+
+dry=0
+verbose=0
+force=0
+
+usage() {
+	printf '%s\n' \
+	    "usage: $prog [-n] [-v] home-copy" \
+	    "       $prog [-n] [-v] -f home-swap" \
+	    "       $prog [-n] [-v] zopen-new" \
+	    "       $prog [-n] [-v] -f delete-old" >&2
+	exit 2
+}
+
+err() { printf '%s: %s\n' "$prog" "$*" >&2; }
+die() { err "$@"; exit 1; }
+info() { if [ "$verbose" -eq 1 ] || [ "$dry" -eq 1 ]; then printf '%s\n' "$*"; fi; }
+
+# run CMD...: execute, or print under -n
+run() {
+	if [ "$dry" -eq 1 ]; then
+		printf '+ %s\n' "$*"
+		return 0
+	fi
+	info "+ $*"
+	"$@"
+}
+
+# idcams: IDCAMS statements on stdin, run via ZOAU mvscmd
+idcams() {
+	ic_in=$(cat)
+	if [ "$dry" -eq 1 ]; then
+		printf '+ mvscmd --pgm=IDCAMS --sysprint=* --sysin=stdin <<\n%s\n' "$ic_in"
+		return 0
+	fi
+	info "IDCAMS:"
+	info "$ic_in"
+	printf '%s\n' "$ic_in" | mvscmd --pgm=IDCAMS --sysprint=* --sysin=stdin
+	ic_rc=$?
+	[ "$ic_rc" -eq 0 ] || err "IDCAMS rc=$ic_rc"
+	return "$ic_rc"
+}
+
+# is_mounted DSNAME
+is_mounted() {
+	df -v 2>/dev/null | grep -q "($1)"
+}
+
+# define_zfs DSNAME "PRI SEC"
+define_zfs() {
+	dz_ds=$1 dz_pri=${2%% *} dz_sec=${2#* }
+	dz_dc=
+	[ -z "$DATACLAS" ] || dz_dc=" DATACLAS($DATACLAS)"
+	idcams <<EOF || die "define $dz_ds failed"
+ DEFINE CLUSTER(NAME($dz_ds) LINEAR -
+        CYLINDERS($dz_pri $dz_sec) SHAREOPTIONS(3)$dz_dc)
+EOF
+	run zfsadm format -aggregate "$dz_ds" -owner "$(id -u)" -group "$(id -g)" \
+	    -perms o755 || die "format $dz_ds failed"
+}
+
+# mount_zfs DSNAME DIR
+mount_zfs() {
+	run mkdir -p "$2" || die "mkdir $2 failed"
+	run $SUDO /usr/sbin/mount -t ZFS -f "$1" "$2" || die "mount $1 on $2 failed"
+}
+
+count() { (cd "$1" && find . -xdev | wc -l | tr -d ' '); }
+
+do_home_copy() {
+	is_mounted "$HOME_NEW" && die "$HOME_NEW is already mounted"
+	define_zfs "$HOME_NEW" "$HOME_CYL"
+	mount_zfs "$HOME_NEW" "$HOME_STAGE"
+	# -X: stay on the home filesystem; separate mounts (e.g. ~/src) are not copied
+	(cd "$HOME_DIR" && run pax -rw -pe -X . "$HOME_STAGE") || die "copy failed"
+	[ "$dry" -eq 1 ] && return 0
+	hc_a=$(count "$HOME_DIR") hc_b=$(count "$HOME_STAGE")
+	info "objects: $hc_a in $HOME_DIR, $hc_b in copy"
+	if [ "$hc_a" != "$hc_b" ]; then
+		err "object count differs ($hc_a vs $hc_b); inspect $HOME_STAGE before swapping"
+		exit 1
+	fi
+	run $SUDO /usr/sbin/unmount "$HOME_STAGE" || die "unmount $HOME_STAGE failed"
+	printf 'copied to %s; next: %s -f home-swap (as superuser, outside %s)\n' \
+	    "$HOME_NEW" "$prog" "$HOME_DIR"
+}
+
+do_home_swap() {
+	[ "$force" -eq 1 ] || die "home-swap needs -f"
+	case $(pwd) in
+	"$HOME_DIR" | "$HOME_DIR"/*) die "cd out of $HOME_DIR first" ;;
+	esac
+	is_mounted "$HOME_NEW" && die "$HOME_NEW is still mounted; unmount it first"
+	# Unmount, rename old->OLD and NEW->original name, remount. Automount may
+	# remount the original name on any access, so keep the gap short.
+	run $SUDO /usr/sbin/unmount "$HOME_DIR" ||
+	    die "unmount $HOME_DIR failed (busy? log out other sessions)"
+	idcams <<EOF || die "rename failed; $HOME_DIR is unmounted, remount $HOME_DS manually"
+ ALTER $HOME_DS NEWNAME($HOME_OLD)
+ ALTER $HOME_DS.DATA NEWNAME($HOME_OLD.DATA)
+ ALTER $HOME_NEW NEWNAME($HOME_DS)
+ ALTER $HOME_NEW.DATA NEWNAME($HOME_DS.DATA)
+EOF
+	run $SUDO /usr/sbin/mount -t ZFS -f "$HOME_DS" "$HOME_DIR" ||
+	    die "mount failed; automount may mount it on next access"
+	printf 'swapped; old home kept as %s (remove with: %s -f delete-old)\n' \
+	    "$HOME_OLD" "$prog"
+}
+
+do_zopen_new() {
+	is_mounted "$ZOPEN_DS" && die "$ZOPEN_DS is already mounted"
+	[ -n "$DATACLAS" ] || err "warning: DATACLAS unset; >4GB aggregates need extended addressability"
+	define_zfs "$ZOPEN_DS" "$ZOPEN_CYL"
+	mount_zfs "$ZOPEN_DS" "$ZOPEN_DIR"
+	printf 'mounted %s on %s\n' "$ZOPEN_DS" "$ZOPEN_DIR"
+}
+
+do_delete_old() {
+	[ "$force" -eq 1 ] || die "delete-old needs -f"
+	is_mounted "$HOME_OLD" && die "$HOME_OLD is mounted; refusing"
+	idcams <<EOF || die "delete $HOME_OLD failed"
+ DELETE $HOME_OLD CLUSTER
+EOF
+}
+
+while getopts fnv opt; do
+	case $opt in
+	f) force=1 ;;
+	n) dry=1 ;;
+	v) verbose=1 ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 1 ] || usage
+
+if [ "$dry" -eq 0 ] && ! command -v mvscmd >/dev/null 2>&1; then
+	die "mvscmd (ZOAU) not in PATH"
+fi
+
+case $1 in
+home-copy) do_home_copy ;;
+home-swap) do_home_swap ;;
+zopen-new) do_zopen_new ;;
+delete-old) do_delete_old ;;
+*) usage ;;
+esac

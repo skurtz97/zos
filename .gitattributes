@@ -1,0 +1,21 @@
+.gitattributes · GITATTRIBUTES
+# z/OS git: files are stored as UTF-8 in the repo and checked out with the
+# encoding and file tag given by zos-working-tree-encoding.
+ 
+# Default: text, LF, tagged ISO8859-1 on z/OS (scripts run via _BPXK_AUTOCVT)
+* text=auto eol=lf
+* git-encoding=utf-8 zos-working-tree-encoding=iso8859-1
+ 
+# Native EBCDIC sources for MVS-side use (JCL, REXX execs)
+*.jcl  zos-working-tree-encoding=ibm-1047
+*.rexx zos-working-tree-encoding=ibm-1047
+*.rex  zos-working-tree-encoding=ibm-1047
+ 
+# Binary: no conversion, no tag
+*.png  binary
+*.jpg  binary
+*.gz   binary
+*.pax  binary
+*.Z    binary
+*.zip  binary
+ 
