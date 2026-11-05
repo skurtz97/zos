@@ -62,16 +62,16 @@ run() {
 	"$@"
 }
 
-# idcams: IDCAMS statements on stdin, run via ZOAU mvscmd
+# idcams: IDCAMS statements on stdin, run via ZOAU mvscmdauth (IDCAMS is authorized)
 idcams() {
 	ic_in=$(cat)
 	if [ "$dry" -eq 1 ]; then
-		printf '+ mvscmd --pgm=IDCAMS --sysprint=* --sysin=stdin <<\n%s\n' "$ic_in"
+		printf '+ mvscmdauth --pgm=IDCAMS --sysprint=* --sysin=stdin <<\n%s\n' "$ic_in"
 		return 0
 	fi
 	info "IDCAMS:"
 	info "$ic_in"
-	printf '%s\n' "$ic_in" | mvscmd --pgm=IDCAMS --sysprint=* --sysin=stdin
+	printf '%s\n' "$ic_in" | mvscmdauth --pgm=IDCAMS --sysprint=* --sysin=stdin
 	ic_rc=$?
 	[ "$ic_rc" -eq 0 ] || err "IDCAMS rc=$ic_rc"
 	return "$ic_rc"
@@ -170,8 +170,8 @@ done
 shift $((OPTIND - 1))
 [ $# -eq 1 ] || usage
 
-if [ "$dry" -eq 0 ] && ! command -v mvscmd >/dev/null 2>&1; then
-	die "mvscmd (ZOAU) not in PATH"
+if [ "$dry" -eq 0 ] && ! command -v mvscmdauth >/dev/null 2>&1; then
+	die "mvscmdauth (ZOAU) not in PATH"
 fi
 
 case $1 in
