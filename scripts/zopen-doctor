@@ -1,0 +1,299 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# zopen-doctor - diagnose and maintain zopen installs on z/OS UNIX
+#
+# usage: zopen-doctor [-v] [-r root] [check]   diagnose; exit 1 if problems found
+#        zopen-doctor [-r root] backup [dir]   pax archive of the root into dir
+#        zopen-doctor [-f] [-r root] prune     list dangling symlinks; -f removes
+#        zopen-doctor reinstall pkg...         reinstall packages via zopen
+#        zopen-doctor termfix                  disable modifyOtherKeys/mouse modes
+#
+# The personal root is -r, else $ZOPEN_ROOT. The system root is
+# /usr/local/zopen, or $ZOPEN_SYSROOT if set. Output is silent unless a
+# problem is found; -v reports every check.
+
+prog=${0##*/}
+sysroot=${ZOPEN_SYSROOT:-/usr/local/zopen}
+root=${ZOPEN_ROOT:-}
+tools='zopen bash cmake make git curl'
+verbose=0
+force=0
+problems=0
+zos=0
+
+usage() {
+	printf '%s\n' \
+	    "usage: $prog [-v] [-r root] [check]" \
+	    "       $prog [-r root] backup [dir]" \
+	    "       $prog [-f] [-r root] prune" \
+	    "       $prog reinstall pkg..." \
+	    "       $prog termfix" >&2
+	exit 2
+}
+
+err() { printf '%s: %s\n' "$prog" "$*" >&2; }
+die() { err "$@"; exit 1; }
+warn() { problems=$((problems + 1)); printf 'warn: %s\n' "$*"; }
+info() { if [ "$verbose" -eq 1 ]; then printf '%s\n' "$*"; fi; }
+first() { printf '%s\n' "$1" | sed -n 1p; }
+
+# owner PATH -> personal, system or other
+owner() {
+	case $1 in
+	"$sysroot"/*) ow=system ;;
+	*) ow=other ;;
+	esac
+	if [ -n "$root" ]; then
+		case $1 in "$root"/*) ow=personal ;; esac
+	fi
+	printf '%s\n' "$ow"
+}
+
+# dangling DIR -> one dangling symlink per line
+dangling() {
+	[ -d "$1" ] || return 0
+	find "$1" -type l -exec sh -c \
+	    'for l do [ -e "$l" ] || printf "%s\n" "$l"; done' sh {} +
+}
+
+check_host() {
+	info "os: $(uname -srv)"
+	info "login shell: ${SHELL:-unset}"
+	if [ -z "$root" ]; then
+		warn "no personal root: set ZOPEN_ROOT or pass -r"
+	elif [ "$root" = "$sysroot" ]; then
+		warn "ZOPEN_ROOT is the system root $sysroot; personal override not active"
+	fi
+}
+
+check_rcfiles() {
+	for rc_f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login" \
+	    "$HOME/.bashrc" "$HOME/.kshrc" "$HOME/.shrc" ${ENV:+"$ENV"}; do
+		[ -f "$rc_f" ] || continue
+		if grep -q -i zopen "$rc_f"; then
+			info "$rc_f references zopen:"
+			if [ "$verbose" -eq 1 ]; then
+				grep -n -i zopen "$rc_f" | sed 's/^/  /'
+			fi
+		fi
+	done
+	# bash login shells read the first of these and skip ~/.profile
+	for rc_f in "$HOME/.bash_profile" "$HOME/.bash_login"; do
+		[ -f "$rc_f" ] || continue
+		if grep -q -i zopen "$HOME/.profile" 2>/dev/null &&
+		    ! grep -q -i zopen "$rc_f" &&
+		    ! grep -q '\.profile' "$rc_f"; then
+			warn "bash login reads $rc_f, which neither sources ~/.profile nor sets up zopen"
+		fi
+		break
+	done
+}
+
+# scan_var NAME VALUE: colon-separated search path checks
+scan_var() {
+	sv_name=$1 sv_seen=: sv_np=0 sv_ns=0
+	set -f
+	sv_ifs=$IFS
+	IFS=:
+	for sv_d in $2; do
+		[ -n "$sv_d" ] || continue
+		case $sv_seen in *":$sv_d:"*) info "$sv_name: duplicate $sv_d" ;; esac
+		sv_seen=$sv_seen$sv_d:
+		[ -d "$sv_d" ] || warn "$sv_name: $sv_d does not exist"
+		case $(owner "$sv_d/") in
+		personal) sv_np=$((sv_np + 1)) ;;
+		system) sv_ns=$((sv_ns + 1)) ;;
+		esac
+	done
+	IFS=$sv_ifs
+	set +f
+	info "$sv_name: $sv_np personal, $sv_ns system entries"
+	if [ "$sv_np" -gt 0 ] && [ "$sv_ns" -gt 0 ]; then
+		warn "$sv_name mixes personal ($root) and system ($sysroot) entries"
+	fi
+}
+
+# tools as resolved in the current environment
+check_tools() {
+	# shellcheck disable=SC2086
+	for ct_t in $tools; do
+		if ! ct_p=$(command -v "$ct_t" 2>/dev/null); then
+			info "$ct_t: not in PATH"
+			continue
+		fi
+		case $ct_p in /*) ;; *) info "$ct_t: $ct_p"; continue ;; esac
+		ct_o=$(owner "$ct_p")
+		info "$ct_t: $ct_p ($ct_o)"
+		if [ -n "$root" ] && [ "$root" != "$sysroot" ] && [ "$ct_o" = system ]; then
+			warn "$ct_t comes from the system root: $ct_p"
+		fi
+		if [ ! -e "$ct_p" ]; then
+			warn "$ct_t: $ct_p is a dangling link"
+			continue
+		fi
+		if [ "$zos" -eq 1 ] && [ "$verbose" -eq 1 ]; then
+			# ls -T (file tag) and ls -E (extattrs) are z/OS-only; no find equivalent
+			# shellcheck disable=SC2012
+			info "  tag:     $(ls -T "$ct_p" 2>/dev/null | awk '{ print $1, $2, $3 }')"
+			# shellcheck disable=SC2012
+			info "  extattr: $(ls -E "$ct_p" 2>/dev/null | awk '{ print $2 }')"
+		fi
+		ct_v=$("$ct_p" --version 2>&1 </dev/null)
+		ct_rc=$?
+		if [ "$ct_rc" -ne 0 ]; then
+			warn "$ct_t --version failed (rc=$ct_rc): $(first "$ct_v")"
+		else
+			info "  $(first "$ct_v")"
+		fi
+	done
+}
+
+# check_root ROOT LABEL
+check_root() {
+	cr_r=$1 cr_l=$2
+	if [ ! -d "$cr_r" ]; then
+		warn "$cr_l root $cr_r does not exist"
+		return
+	fi
+	info "$cr_l root: $cr_r"
+	[ -f "$cr_r/etc/zopen-config" ] || warn "$cr_l: $cr_r/etc/zopen-config missing"
+	if [ -w "$cr_r" ]; then info "$cr_l: writable"; else info "$cr_l: read-only to you"; fi
+
+	cr_df=$(df -kP "$cr_r" 2>/dev/null |
+	    awk 'NR == 2 { sub(/%/, "", $5); print $5, $6 }')
+	cr_pct=${cr_df%% *} cr_mnt=${cr_df#* }
+	case $cr_pct in
+	'' | *[!0-9]*) info "$cr_l: could not read filesystem usage" ;;
+	*)
+		info "$cr_l: filesystem $cr_mnt ${cr_pct}% full"
+		[ "$cr_pct" -lt 90 ] || warn "$cr_l: filesystem $cr_mnt is ${cr_pct}% full"
+		;;
+	esac
+
+	cr_dl=$(dangling "$cr_r/usr/local")
+	if [ -n "$cr_dl" ]; then
+		cr_n=$(printf '%s\n' "$cr_dl" | wc -l | tr -d ' ')
+		warn "$cr_l: $cr_n dangling symlink(s); list with: $prog -r $cr_r prune"
+		info "$cr_dl"
+	fi
+
+	# Source the root's zopen-config in an empty environment and exercise
+	# each tool, isolating the install from login-script overrides.
+	# shellcheck disable=SC2086,SC2016
+	cr_out=$(env -i HOME="$HOME" LOGNAME="${LOGNAME:-}" PATH=/bin:/usr/bin \
+	    /bin/sh -c '
+		r=$1
+		shift
+		if ! . "$r/etc/zopen-config" >/dev/null 2>&1; then
+			echo "W zopen-config returned nonzero"
+		fi
+		for t do
+			if ! p=$(command -v "$t"); then
+				echo "I $t: not found"
+				continue
+			fi
+			case $p in
+			"$r"/*) ;;
+			*) echo "I $t: resolves outside root: $p" ;;
+			esac
+			"$t" --version >/dev/null 2>&1 </dev/null ||
+			    echo "W $t --version failed (rc=$?)"
+		done' sh "$cr_r" $tools 2>&1)
+	while IFS= read -r cr_line; do
+		case $cr_line in
+		'W '*) warn "$cr_l (clean env): ${cr_line#W }" ;;
+		'I '*) info "$cr_l (clean env): ${cr_line#I }" ;;
+		esac
+	done <<EOF
+$cr_out
+EOF
+}
+
+do_check() {
+	check_host
+	check_rcfiles
+	scan_var PATH "$PATH"
+	scan_var LIBPATH "${LIBPATH:-}"
+	check_tools
+	check_root "$sysroot" system
+	if [ -n "$root" ] && [ "$root" != "$sysroot" ]; then
+		check_root "$root" personal
+	fi
+	if [ "$problems" -gt 0 ]; then
+		printf '%d problem(s)\n' "$problems"
+		return 1
+	fi
+}
+
+do_backup() {
+	bk_r=${root:-$sysroot}
+	[ -d "$bk_r" ] || die "$bk_r: no such directory"
+	bk_dir=${1:-$HOME}
+	if ! { [ -d "$bk_dir" ] && [ -w "$bk_dir" ]; }; then
+		die "$bk_dir: not a writable directory"
+	fi
+	bk_base=$(basename "$bk_r")
+	bk_out=$bk_dir/zopen-$bk_base-$(date +%Y%m%d%H%M%S).pax
+	(cd "$(dirname "$bk_r")" && pax -wf "$bk_out" "$bk_base") || die "pax failed"
+	printf '%s\n' "$bk_out"
+}
+
+do_prune() {
+	pr_r=${root:-$sysroot}
+	pr_list=$(dangling "$pr_r/usr/local")
+	[ -n "$pr_list" ] || return 0
+	if [ "$force" -eq 0 ]; then
+		printf '%s\n' "$pr_list"
+		err "dry run; use -f to remove"
+		return 0
+	fi
+	printf '%s\n' "$pr_list" | while IFS= read -r pr_l; do
+		if rm -f -- "$pr_l"; then info "removed $pr_l"; else err "$pr_l: rm failed"; fi
+	done
+}
+
+do_reinstall() {
+	[ $# -gt 0 ] || usage
+	command -v zopen >/dev/null 2>&1 || die "zopen not in PATH"
+	if ! zopen install --help 2>&1 | grep -q -e '--reinstall'; then
+		die "this zopen has no 'install --reinstall'; see 'zopen install --help'"
+	fi
+	zopen install --reinstall "$@"
+}
+
+# ESC is 0x27 in EBCDIC and 0x1b in ASCII; pick the one this shell emits.
+do_termfix() {
+	case $(printf 'A' | od -A n -t x1 | tr -d ' \n') in
+	c1) tf_e=$(printf '\047') ;;
+	*) tf_e=$(printf '\033') ;;
+	esac
+	printf '%s' "${tf_e}[>4;0m${tf_e}[?1000l${tf_e}[?1002l${tf_e}[?1003l" \
+	    "${tf_e}[?1005l${tf_e}[?1006l${tf_e}[?1015l"
+}
+
+while getopts fr:v opt; do
+	case $opt in
+	f) force=1 ;;
+	r) root=$OPTARG ;;
+	v) verbose=1 ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+root=${root%/}
+sysroot=${sysroot%/}
+if [ "$(uname -s)" = OS/390 ]; then zos=1; fi
+
+cmd=${1:-check}
+[ $# -eq 0 ] || shift
+
+case $cmd in
+check) do_check ;;
+backup) do_backup "$@" ;;
+prune) do_prune ;;
+reinstall) do_reinstall "$@" ;;
+termfix) do_termfix ;;
+*) usage ;;
+esac
