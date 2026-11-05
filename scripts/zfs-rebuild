@@ -32,6 +32,7 @@ ZOPEN_DS=${ZOPEN_DS:-$user.ZOPEN.NEW.ZFS}
 ZOPEN_CYL=${ZOPEN_CYL:-8000 1000}
 ZOPEN_DIR=${ZOPEN_DIR:-$HOME_DIR/zopen-new}
 DATACLAS=${DATACLAS:-}                        # extended-addressability class for >4GB
+VOLUMES=${VOLUMES:-}                          # e.g. CBTU01; required when SMS assigns no STORCLAS
 
 SUDO=${SUDO-sudo}                             # set SUDO= if already superuser
 
@@ -87,6 +88,7 @@ define_zfs() {
 	dz_ds=$1 dz_pri=${2%% *} dz_sec=${2#* }
 	dz_dc=
 	[ -z "$DATACLAS" ] || dz_dc=" DATACLAS($DATACLAS)"
+	[ -z "$VOLUMES" ] || dz_dc="$dz_dc VOLUMES($VOLUMES)"
 	idcams <<EOF || die "define $dz_ds failed"
  DEFINE CLUSTER(NAME($dz_ds) LINEAR -
         CYLINDERS($dz_pri $dz_sec) SHAREOPTIONS(3)$dz_dc)
@@ -137,8 +139,13 @@ do_home_swap() {
  ALTER $HOME_NEW NEWNAME($HOME_DS)
  ALTER $HOME_NEW.DATA NEWNAME($HOME_DS.DATA)
 EOF
-	run $SUDO /usr/sbin/mount -t ZFS -f "$HOME_DS" "$HOME_DIR" ||
-	    die "mount failed; automount may mount it on next access"
+	# Under automount (e.g. /u) the mount point vanishes on unmount; touching
+	# the path makes automount mount $HOME_DS, now the new aggregate.
+	if ! run $SUDO /usr/sbin/mount -t ZFS -f "$HOME_DS" "$HOME_DIR" 2>/dev/null; then
+		ls "$HOME_DIR" >/dev/null 2>&1
+		is_mounted "$HOME_DS" || die "mount of $HOME_DS on $HOME_DIR failed"
+		info "mounted by automount"
+	fi
 	printf 'swapped; old home kept as %s (remove with: %s -f delete-old)\n' \
 	    "$HOME_OLD" "$prog"
 }
